@@ -159,7 +159,77 @@ def process_bulk_users_background(csv_content: str, db_session_factory):
     finally:
         db.close()
 # --- Pydantic Schemas ---
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
 
+# 1. Initialize Firebase Admin in main.py (if not already done)
+if not firebase_admin._apps:
+    try:
+        cred = credentials.Certificate("firebase-credentials.json")
+        firebase_admin.initialize_app(cred)
+    except Exception as e:
+        print(f"[!] Firebase Init Error in main.py: {e}")
+
+# 2. Add the Request Schema
+class SocialLoginRequest(BaseModel):
+    id_token: str
+    provider: str
+    device_token: Optional[str] = None
+
+# 3. Add the Social Auth Endpoint
+@app.post("/api/v1/auth/social")
+def social_login(request: SocialLoginRequest, db: Session = Depends(get_db)):
+    """Handles Google & Apple Sign-In via Firebase tokens"""
+    try:
+        # Verify the secure token with Google/Firebase
+        decoded_token = firebase_auth.verify_id_token(request.id_token)
+        email = decoded_token.get("email")
+        full_name = decoded_token.get("name", "SmartHub User")
+        avatar_url = decoded_token.get("picture")
+
+        if not email:
+            raise HTTPException(status_code=400, detail="Social provider did not return an email.")
+
+        # Check if user already exists in our PostgreSQL DB
+        user = db.query(models.User).filter(models.User.email == email).first()
+
+        if not user:
+            # AUTO-REGISTER: Create the user silently with a secure random password
+            alphabet = string.ascii_letters + string.digits
+            random_pass = "".join(secrets.choice(alphabet) for _ in range(16))
+            hashed_password = get_password_hash(random_pass)
+            
+            user = models.User(
+                email=email,
+                full_name=full_name,
+                hashed_password=hashed_password,
+                avatar_url=avatar_url,
+                device_tokens=[request.device_token] if request.device_token else []
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        else:
+            # UPDATE DEVICE TOKEN: For existing users
+            if request.device_token:
+                if user.device_tokens is None:
+                    user.device_tokens = []
+                if request.device_token not in user.device_tokens:
+                    updated_tokens = list(user.device_tokens)
+                    updated_tokens.append(request.device_token)
+                    user.device_tokens = updated_tokens
+                    db.commit()
+
+        # Generate our standard SmartHub JWT
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.email}, expires_delta=access_token_expires
+        )
+        return {"access_token": access_token, "token_type": "bearer"}
+
+    except Exception as e:
+        print(f"Social Login Error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid social authentication token")
 @app.post("/api/v1/auth/register", status_code=status.HTTP_201_CREATED)
 def register_user(
     email: str = Form(...),
@@ -200,7 +270,30 @@ def register_user(
     db.add(new_user)
     db.commit()
     return {"message": "User created successfully"}
+class DeviceTokenRequest(BaseModel):
+    token: str
 
+@app.post("/api/v1/auth/device-token")
+def update_device_token(
+    request: DeviceTokenRequest, 
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    """Saves the Firebase device token so the user can receive pushes."""
+    # Initialize the array if it's null
+    if current_user.device_tokens is None:
+        current_user.device_tokens = []
+        
+    # Only add it if we don't already have it
+    if request.token not in current_user.device_tokens:
+        # We make a copy, append, and reassign so SQLAlchemy detects the change to the JSON array
+        updated_tokens = list(current_user.device_tokens)
+        updated_tokens.append(request.token)
+        current_user.device_tokens = updated_tokens
+        
+        db.commit()
+        
+    return {"message": "Device token registered."}
 # UPDATE YOUR PROFILE GETTER TO RETURN THE AVATAR
 # UPDATE YOUR PROFILE GETTER
 @app.get("/api/v1/auth/profile")
@@ -337,13 +430,29 @@ def delete_user(id: str, db: Session = Depends(get_db), admin_user: models.User 
     db.delete(user_to_delete)
     db.commit()
     return {"message": "User deleted successfully"}
-@app.post("/api/v1/auth/logout")
-def logout():
-    # Since JWTs are stateless, actual logout is handled by the Flutter app deleting the token.
-    # This endpoint satisfies the PDF specification for the backend API.
+# Add this data model near your other Pydantic models
+class LogoutRequest(BaseModel):
+    fcm_token: Optional[str] = None
+
+# Add this endpoint
+@app.post("/api/v1/auth/logout", status_code=200)
+def logout_user(
+    request: LogoutRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Handles secure logout and cleans up push notification tokens."""
+    print(f"[AUTH] User '{current_user.email}' securely logged out.")
+    
+    # If the app sends the phone's FCM token, remove it from the database
+    if request.fcm_token and current_user.device_tokens:
+        if request.fcm_token in current_user.device_tokens:
+            # Create a new list without the old token to force SQLAlchemy to detect the change
+            current_user.device_tokens = [t for t in current_user.device_tokens if t != request.fcm_token]
+            db.commit()
+            print(f"[AUTH] Cleared device token for {current_user.email}. Push notifications stopped.")
+            
     return {"message": "Successfully logged out"}
-# --- QUEUE ENDPOINTS (From Previous Step) ---
-# ... Keep your existing /notify/bulk and /notify/jobs/{job_id} endpoints here ...
 
 # RabbitMQ Publisher Setup
 def publish_batch_to_queue(queue_name: str, messages: list):
@@ -861,3 +970,101 @@ async def send_message_to_ai(
                 db_write.close()
 
     return StreamingResponse(streaming_generator(), media_type="text/event-stream")
+
+# ... your existing imports ...
+
+class LiveBulkPushRequest(BaseModel):
+    title: str
+    message: str
+
+# --- ADMIN TRIGGER ENDPOINT ---
+# --- ADMIN TRIGGER ENDPOINT ---
+@app.post("/api/v1/notify/bulk/push", status_code=202)
+def admin_trigger_bulk_push(
+    job: LiveBulkPushRequest, 
+    db: Session = Depends(get_db),
+    admin_user: models.User = Depends(get_admin_user)
+):
+    """Admin endpoint to broadcast a push notification to regular users only."""
+    
+    # --- THE FIX IS HERE ---
+    # Fetch all users EXCEPT admins (is_admin == False or is_admin is None)
+    all_users = db.query(models.User).filter(
+        (models.User.is_admin == False) | (models.User.is_admin == None)
+    ).all()
+    
+    if not all_users:
+        raise HTTPException(status_code=404, detail="No regular users found in database.")
+
+    # 2. Write to the Inbox for EVERY regular user
+    for user in all_users:
+        inbox_record = models.AppNotification(
+            id=str(uuid.uuid4()), 
+            user_id=user.id,
+            title=job.title,
+            message=job.message
+        )
+        db.add(inbox_record)
+        db.flush() 
+
+    db.commit()
+    # 3. Gather active Firebase tokens (only for users who have logged in on a phone)
+    all_tokens = []
+    for user in all_users:
+        if user.device_tokens:
+            all_tokens.extend(user.device_tokens) 
+
+    if not all_tokens:
+        return {"message": "Inbox updated, but no active device tokens found for push delivery."}
+
+    # 4. Chunk tokens into arrays of 500 (Firebase hard limit) and send to RabbitMQ
+    chunk_size = 500
+    tasks = []
+    job_tracking_id = f"bulk_push_{uuid.uuid4()}"
+
+    for i in range(0, len(all_tokens), chunk_size):
+        token_chunk = all_tokens[i:i + chunk_size]
+        
+        tasks.append({
+            "job_id": job_tracking_id, 
+            "task_id": f"batch_{i // chunk_size}",
+            "channel": "push",
+            "title": job.title,
+            "message": job.message,
+            "recipient": token_chunk 
+        })
+        
+    publish_batch_to_queue("push.process", tasks)
+    
+    return {
+        "status": "Success", 
+        "users_inboxed": len(all_users),
+        "devices_targeted": len(all_tokens)
+    }
+# --- INBOX FETCH ENDPOINTS (For the Flutter App) ---
+@app.get("/api/v1/notifications/inbox")
+def get_my_inbox(
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    """Flutter app calls this to populate the notification screen."""
+    return db.query(models.AppNotification).filter(
+        models.AppNotification.user_id == current_user.id
+    ).order_by(models.AppNotification.created_at.desc()).all()
+
+@app.put("/api/v1/notifications/inbox/{notif_id}/read")
+def mark_inbox_item_read(
+    notif_id: str,
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    """Flutter app calls this when a user taps a notification."""
+    notif = db.query(models.AppNotification).filter(
+        models.AppNotification.id == notif_id,
+        models.AppNotification.user_id == current_user.id
+    ).first()
+    
+    if notif:
+        notif.is_read = True
+        db.commit()
+    return {"status": "success"}

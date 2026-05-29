@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+
 import 'user_management_screen.dart';
 import 'queue_dashboard.dart';
 import 'profile_screen.dart';
@@ -10,6 +11,7 @@ import 'todo_screen.dart';
 import 'notification_screen.dart';
 import 'chat_screen.dart';
 import 'document_screen.dart';
+import '../services/push_notification_service.dart';
 
 class MainLayout extends StatefulWidget {
   final String token;
@@ -20,13 +22,15 @@ class MainLayout extends StatefulWidget {
 }
 
 class _MainLayoutState extends State<MainLayout> {
-  int _currentIndex = 1; // Default to Profile Screen (Index 1) instead of Admin Queue (Index 0)
+  // Default to Profile Screen (Index 2) to ensure non-admins don't default to an admin screen
+  int _currentIndex = 2; 
   bool isAdmin = false;
   bool isLoadingRole = true;
 
   @override
   void initState() {
     super.initState();
+    PushNotificationService().initialize(widget.token);
     _checkUserRole();
   }
 
@@ -52,8 +56,30 @@ class _MainLayoutState extends State<MainLayout> {
 
   void _logout() async {
     final prefs = await SharedPreferences.getInstance();
+    
+    // 1. Get the FCM token if we stored it locally during login
+    final String? fcmToken = prefs.getString('fcm_device_token'); 
+
+    // 2. Ping the backend to announce the logout and kill push notifications
+    try {
+      await http.post(
+        Uri.parse('http://localhost:8000/api/v1/auth/logout'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${widget.token}',
+        },
+        body: json.encode({
+          'fcm_token': fcmToken 
+        }),
+      );
+    } catch (e) {
+      debugPrint("Backend ping failed, but proceeding with local logout: $e");
+    }
+
+    // 3. Wipe local memory
     await prefs.remove('jwt_token');
     
+    // 4. Return to Auth Screen
     if (mounted) {
       Navigator.pushAndRemoveUntil(
         context,
@@ -63,15 +89,20 @@ class _MainLayoutState extends State<MainLayout> {
     }
   }
 
-  // Define the screens for the sidebar
-  late final List<Widget> _screens = [
-    UserManagementScreen(token: widget.token,onUnauthorized: _logout),                      // Index 0 (Admin Only)
-    QueueDashboard(token: widget.token, onUnauthorized: _logout),      // Index 0 (Admin Only)
-    ProfileScreen(token: widget.token, onUnauthorized: _logout),       // Index 1
-    ChatScreen(token: widget.token, onUnauthorized: _logout),          // Index 2
-    DocumentScreen(token: widget.token, onUnauthorized: _logout),      // Index 3 
-    TodoScreen(token: widget.token, onUnauthorized: _logout),          // Index 4
-    NotificationsScreen(token: widget.token, onUnauthorized: _logout), // Index 5
+  // FIXED: Changed from a static list to a getter (=>) so it dynamically 
+  // updates the NotificationsScreen whenever `isAdmin` changes.
+  List<Widget> get _screens => [
+    UserManagementScreen(token: widget.token, onUnauthorized: _logout), // Index 0 (Admin Only)
+    QueueDashboard(token: widget.token, onUnauthorized: _logout),       // Index 1 (Admin Only)
+    ProfileScreen(token: widget.token, onUnauthorized: _logout),        // Index 2
+    ChatScreen(token: widget.token, onUnauthorized: _logout),           // Index 3
+    DocumentScreen(token: widget.token, onUnauthorized: _logout),       // Index 4 
+    TodoScreen(token: widget.token, onUnauthorized: _logout),           // Index 5
+    NotificationsScreen(
+      token: widget.token,
+      isAdmin: isAdmin,         // FIXED: Passed the correct variable name
+      onUnauthorized: _logout,  // FIXED: Passed the correct function name
+    ), // Index 6
   ];
 
   @override
@@ -106,9 +137,10 @@ class _MainLayoutState extends State<MainLayout> {
                 padding: EdgeInsets.all(16.0),
                 child: Center(child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))),
               )
-            else if (isAdmin) 
+            else if (isAdmin) ...[ // FIXED: Added Dart spread operator ...[] for multiple widgets
               _buildDrawerItem(Icons.people_alt_outlined, 'User Management', 0),
               _buildDrawerItem(Icons.queue, 'Notification Queue (Admin)', 1),
+            ],
             // -----------------------------------
             
             const Divider(),

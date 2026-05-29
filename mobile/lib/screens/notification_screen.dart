@@ -4,10 +4,15 @@ import 'dart:convert';
 
 class NotificationsScreen extends StatefulWidget {
   final String token;
+  final bool isAdmin; // <-- 1. Add this variable
   final VoidCallback onUnauthorized;
 
-  const NotificationsScreen({super.key, required this.token, required this.onUnauthorized});
-
+  const NotificationsScreen({
+    super.key, 
+    required this.token, 
+    required this.isAdmin, // <-- Require it in the constructor
+    required this.onUnauthorized
+  });
   @override
   State<NotificationsScreen> createState() => _NotificationsScreenState();
 }
@@ -23,43 +28,81 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     _fetchUserNotifications();
   }
 
+  // --- UPGRADED: FETCH REAL DATABASE INBOX ---
   Future<void> _fetchUserNotifications() async {
-    // Note: Since a specific GET /notifications endpoint wasn't in the base PDF API list,
-    // this simulates fetching personal alerts (Chat replies, Todo reminders, System alerts).
-    // You can wire this up to a real endpoint once you build it, or keep the mock data for the demo!
-    
-    await Future.delayed(const Duration(milliseconds: 800)); // Simulate network delay
-    
-    if (mounted) {
-      setState(() {
-        notifications = [
-          {
-            "id": "1",
-            "type": "chat",
-            "title": "New AI Response",
-            "message": "SmartHub has finished generating a summary for your document.",
-            "is_read": false,
-            "time": "Just now"
-          },
-          {
-            "id": "2",
-            "type": "todo",
-            "title": "Task Reminder",
-            "message": "Your task 'Submit Frontend Build' is due tomorrow.",
-            "is_read": false,
-            "time": "2 hours ago"
-          },
-          {
-            "id": "3",
-            "type": "system",
-            "title": "Security Alert",
-            "message": "A new login was detected on a Web Browser.",
-            "is_read": true,
-            "time": "Yesterday"
-          }
-        ];
-        isLoading = false;
-      });
+    try {
+      final response = await http.get(
+        Uri.parse('$apiUrl/notifications/inbox'),
+        headers: {
+          'Authorization': 'Bearer ${widget.token}',
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final List<dynamic> data = json.decode(response.body);
+        if (mounted) {
+          setState(() {
+            // Map the backend DB fields to the UI fields
+            notifications = data.map((item) {
+              return {
+                "id": item["id"].toString(),
+                "type": "system", // Defaulting to system icon for admin pushes
+                "title": item["title"] ?? "SmartHub Alert",
+                "message": item["message"] ?? "",
+                "is_read": item["is_read"] ?? false,
+                "time": _formatDate(item["created_at"]),
+              };
+            }).toList();
+            isLoading = false;
+          });
+        }
+      } else if (response.statusCode == 401) {
+        widget.onUnauthorized();
+      } else {
+        if (mounted) setState(() => isLoading = false);
+      }
+    } catch (e) {
+      if (mounted) setState(() => isLoading = false);
+      print("Error fetching inbox: $e");
+    }
+  }
+
+  // Helper to format backend ISO strings to readable time
+  String _formatDate(String? isoString) {
+    if (isoString == null) return "Just now";
+    try {
+      final DateTime date = DateTime.parse(isoString).toLocal();
+      final DateTime now = DateTime.now();
+      final Duration diff = now.difference(date);
+      
+      if (diff.inMinutes < 1) return "Just now";
+      if (diff.inHours < 1) return "${diff.inMinutes}m ago";
+      if (diff.inDays < 1) return "${diff.inHours}h ago";
+      if (diff.inDays < 7) return "${diff.inDays}d ago";
+      return "${date.month}/${date.day}/${date.year}";
+    } catch (e) {
+      return "Recently";
+    }
+  }
+
+  // --- UPGRADED: MARK SINGLE ITEM AS READ IN DB ---
+  Future<void> _markAsRead(String id, int index) async {
+    if (notifications[index]['is_read']) return; // Already read
+
+    // 1. Optimistic UI update (feels instantly responsive)
+    setState(() {
+      notifications[index]['is_read'] = true;
+    });
+
+    // 2. Background sync to Database
+    try {
+      await http.put(
+        Uri.parse('$apiUrl/notifications/inbox/$id/read'),
+        headers: {'Authorization': 'Bearer ${widget.token}'},
+      );
+    } catch (e) {
+      print("Failed to sync read status: $e");
+      // Optionally revert UI if it fails
     }
   }
 
@@ -69,17 +112,17 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
         notif['is_read'] = true;
       }
     });
+    // For a production app, you would add a "mark all read" endpoint to your backend too
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('All notifications marked as read.')),
+      const SnackBar(content: Text('All notifications marked as read locally.')),
     );
   }
 
-  // --- UPGRADED: MULTI-CHANNEL SINGLE DISPATCH ---
   void _showComposeMessageSheet() {
     final TextEditingController recipientController = TextEditingController();
     final TextEditingController messageController = TextEditingController();
     bool isSending = false;
-    String selectedChannel = 'email'; // Default channel
+    String selectedChannel = 'push'; // Default to push now
 
     showModalBottomSheet(
       context: context,
@@ -88,12 +131,13 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
       builder: (context) {
         return StatefulBuilder(
           builder: (BuildContext context, StateSetter setModalState) {
-            
-            // Dynamic UI helpers
             bool isPhone = selectedChannel == 'sms' || selectedChannel == 'whatsapp';
             String hintText = isPhone ? "+1 (555) 123-4567" : "student@example.com";
             IconData prefixIcon = isPhone ? Icons.phone_android : Icons.alternate_email;
             
+            // If Push is selected, we don't need a specific recipient because our Admin Push targets EVERYONE
+            bool isBulkPush = selectedChannel == 'push';
+
             return Padding(
               padding: EdgeInsets.only(
                 bottom: MediaQuery.of(context).viewInsets.bottom,
@@ -103,21 +147,19 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Text('Send Direct Message', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF0F172A))),
+                  const Text('Send Notification', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF0F172A))),
                   const SizedBox(height: 16),
                   
-                  // Channel Selector
                   SegmentedButton<String>(
                     segments: const [
+                      ButtonSegment(value: 'push', label: Text('App Push'), icon: Icon(Icons.notifications_active)),
                       ButtonSegment(value: 'email', label: Text('Email'), icon: Icon(Icons.email_outlined)),
-                      ButtonSegment(value: 'sms', label: Text('SMS'), icon: Icon(Icons.message_outlined)),
-                      ButtonSegment(value: 'whatsapp', label: Text('WhatsApp'), icon: Icon(Icons.chat_outlined)),
                     ],
                     selected: {selectedChannel},
                     onSelectionChanged: (Set<String> newSelection) {
                       setModalState(() {
                         selectedChannel = newSelection.first;
-                        recipientController.clear(); // Clear input when switching types
+                        recipientController.clear();
                       });
                     },
                     style: ButtonStyle(
@@ -133,24 +175,26 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                   ),
                   const SizedBox(height: 20),
 
-                  TextField(
-                    controller: recipientController,
-                    keyboardType: isPhone ? TextInputType.phone : TextInputType.emailAddress,
-                    decoration: InputDecoration(
-                      labelText: isPhone ? 'Recipient Phone Number' : 'Recipient Email',
-                      hintText: hintText,
-                      prefixIcon: Icon(prefixIcon),
-                      border: const OutlineInputBorder(),
+                  if (!isBulkPush) ...[
+                    TextField(
+                      controller: recipientController,
+                      keyboardType: TextInputType.emailAddress,
+                      decoration: InputDecoration(
+                        labelText: 'Recipient Email',
+                        hintText: hintText,
+                        prefixIcon: Icon(prefixIcon),
+                        border: const OutlineInputBorder(),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 16),
+                    const SizedBox(height: 16),
+                  ],
                   
                   TextField(
                     controller: messageController,
                     maxLines: 3,
-                    decoration: const InputDecoration(
-                      labelText: 'Message content...',
-                      border: OutlineInputBorder(),
+                    decoration: InputDecoration(
+                      labelText: isBulkPush ? 'Broadcast Message...' : 'Message content...',
+                      border: const OutlineInputBorder(),
                     ),
                   ),
                   const SizedBox(height: 24),
@@ -162,7 +206,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                       foregroundColor: Colors.white,
                     ),
                     onPressed: isSending ? null : () async {
-                      if (recipientController.text.isEmpty || messageController.text.isEmpty) {
+                      if ((!isBulkPush && recipientController.text.isEmpty) || messageController.text.isEmpty) {
                         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please fill all fields')));
                         return;
                       }
@@ -170,28 +214,36 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                       setModalState(() => isSending = true);
 
                       try {
+                        // Choose between the single send or the admin bulk push endpoint
+                        final url = isBulkPush 
+                            ? '$apiUrl/notify/bulk/push' 
+                            : '$apiUrl/notify/send';
+                            
+                        final body = isBulkPush 
+                            ? {'title': 'Admin Broadcast', 'message': messageController.text.trim()}
+                            : {'channel': selectedChannel, 'recipient': recipientController.text.trim(), 'message': messageController.text.trim()};
+
                         final response = await http.post(
-                          Uri.parse('$apiUrl/notify/send'),
+                          Uri.parse(url),
                           headers: {
                             'Content-Type': 'application/json',
                             'Authorization': 'Bearer ${widget.token}',
                           },
-                          body: json.encode({
-                            'channel': selectedChannel, // Sends the selected channel to FastAPI
-                            'recipient': recipientController.text.trim(),
-                            'message': messageController.text.trim(),
-                          }),
+                          body: json.encode(body),
                         );
 
-                        if (response.statusCode == 200) {
+                        if (response.statusCode == 200 || response.statusCode == 202) {
                           if (mounted) {
                             Navigator.pop(context);
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Message sent via ${selectedChannel.toUpperCase()}!'), backgroundColor: Colors.green));
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Successfully dispatched via ${selectedChannel.toUpperCase()}!'), backgroundColor: Colors.green));
+                            
+                            // Refresh inbox to see our own broadcast
+                            if (isBulkPush) _fetchUserNotifications(); 
                           }
-                        } else if (response.statusCode == 401) {
-                          widget.onUnauthorized();
+                        } else if (response.statusCode == 401 || response.statusCode == 403) {
+                          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Admin privileges required.'), backgroundColor: Colors.red));
                         } else {
-                          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to send message.'), backgroundColor: Colors.red));
+                          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to dispatch.'), backgroundColor: Colors.red));
                         }
                       } catch (e) {
                         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Network error.'), backgroundColor: Colors.red));
@@ -201,7 +253,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     },
                     child: isSending 
                         ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                        : Text('SEND VIA ${selectedChannel.toUpperCase()}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                        : Text(isBulkPush ? 'BROADCAST TO ALL USERS' : 'SEND DIRECT MESSAGE', style: const TextStyle(fontWeight: FontWeight.bold)),
                   ),
                   const SizedBox(height: 24),
                 ],
@@ -265,78 +317,83 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     final notif = notifications[index];
                     final bool isRead = notif['is_read'];
                     
-                    return Card(
-                      elevation: 0,
-                      margin: const EdgeInsets.only(bottom: 12),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        side: BorderSide(color: isRead ? Colors.transparent : Colors.blue.shade100, width: 1.5),
-                      ),
-                      color: isRead ? Colors.white : Colors.blue.shade50.withOpacity(0.3),
-                      child: Padding(
-                        padding: const EdgeInsets.all(16.0),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.all(10),
-                              decoration: BoxDecoration(
-                                color: _getColorForType(notif['type']).withOpacity(0.1),
-                                shape: BoxShape.circle,
+                    // Wrapped Card in a GestureDetector to trigger _markAsRead
+                    return GestureDetector(
+                      onTap: () => _markAsRead(notif['id'], index),
+                      child: Card(
+                        elevation: 0,
+                        margin: const EdgeInsets.only(bottom: 12),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          side: BorderSide(color: isRead ? Colors.transparent : Colors.blue.shade100, width: 1.5),
+                        ),
+                        color: isRead ? Colors.white : Colors.blue.shade50.withOpacity(0.3),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(10),
+                                decoration: BoxDecoration(
+                                  color: _getColorForType(notif['type']).withOpacity(0.1),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  _getIconForType(notif['type']), 
+                                  color: _getColorForType(notif['type']),
+                                  size: 24
+                                ),
                               ),
-                              child: Icon(
-                                _getIconForType(notif['type']), 
-                                color: _getColorForType(notif['type']),
-                                size: 24
-                              ),
-                            ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Row(
-                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                    children: [
-                                      Text(
-                                        notif['title'], 
-                                        style: TextStyle(
-                                          fontWeight: isRead ? FontWeight.w600 : FontWeight.w800, 
-                                          color: const Color(0xFF0F172A),
-                                          fontSize: 15,
-                                        )
-                                      ),
-                                      Text(
-                                        notif['time'], 
-                                        style: TextStyle(color: Colors.grey.shade500, fontSize: 11)
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    notif['message'], 
-                                    style: TextStyle(
-                                      color: Colors.black87, 
-                                      height: 1.4,
-                                      fontWeight: isRead ? FontWeight.normal : FontWeight.w500
+                              const SizedBox(width: 16),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                      children: [
+                                        Text(
+                                          notif['title'], 
+                                          style: TextStyle(
+                                            fontWeight: isRead ? FontWeight.w600 : FontWeight.w800, 
+                                            color: const Color(0xFF0F172A),
+                                            fontSize: 15,
+                                          )
+                                        ),
+                                        Text(
+                                          notif['time'], 
+                                          style: TextStyle(color: Colors.grey.shade500, fontSize: 11)
+                                        ),
+                                      ],
                                     ),
-                                  ),
-                                ],
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      notif['message'], 
+                                      style: TextStyle(
+                                        color: Colors.black87, 
+                                        height: 1.4,
+                                        fontWeight: isRead ? FontWeight.normal : FontWeight.w500
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
                       ),
                     );
                   },
                 ),
-      // --- UPGRADED: FLOATING ACTION BUTTON ---
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _showComposeMessageSheet,
-        backgroundColor: const Color(0xFF0F172A),
-        icon: const Icon(Icons.edit_square, color: Colors.white),
-        label: const Text("New Message", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-      ),
+      floatingActionButton: widget.isAdmin 
+          ? FloatingActionButton.extended(
+              onPressed: _showComposeMessageSheet,
+              backgroundColor: const Color(0xFF0F172A),
+              icon: const Icon(Icons.podcasts, color: Colors.white),
+              label: const Text("Broadcast", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            )
+          : null,
     );
   }
 }

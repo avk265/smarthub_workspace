@@ -40,7 +40,11 @@ dependencies:
   cached_network_image: ^3.4.1
   file_picker: ^8.0.0
   flutter_markdown: ^0.7.7+1
-
+  firebase_core: ^4.9.0
+  firebase_messaging: ^16.2.2
+  firebase_auth: ^6.5.1
+  google_sign_in: ^7.1.1
+  google_sign_in_web: ^1.0.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

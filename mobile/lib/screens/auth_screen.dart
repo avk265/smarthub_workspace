@@ -1,11 +1,16 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb; // Needed to check if running on Chrome
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:google_sign_in_web/web_only.dart' as web; // The official Google Web Button
 import 'dart:convert';
 import 'dart:io';
+
 import 'main_layout.dart';
 import 'reset_password_screen.dart';
+
 class AuthScreen extends StatefulWidget {
   const AuthScreen({super.key});
 
@@ -14,6 +19,9 @@ class AuthScreen extends StatefulWidget {
 }
 
 class _AuthScreenState extends State<AuthScreen> {
+  // 1. Use the new Version 7 Singleton Instance
+  final GoogleSignIn _googleSignIn = GoogleSignIn.instance;
+
   bool isLogin = true;
   bool isLoading = false;
   
@@ -22,11 +30,88 @@ class _AuthScreenState extends State<AuthScreen> {
   final TextEditingController nameController = TextEditingController();
   final TextEditingController phoneController = TextEditingController();
   
-  final String apiUrl = 'http://localhost:8000/api/v1';
-  final String simulatedDeviceToken = "fcm_token_pixel_8_pro_dummy_123";
+  final String apiUrl = 'http://localhost:8000/api/v1'; 
+  final String simulatedDeviceToken = "fcm_token_";
 
   File? _profileImage;
   final ImagePicker _picker = ImagePicker();
+
+  @override
+  void initState() {
+    super.initState();
+    _setupGoogleSignIn();
+  }
+
+  // --- VERSION 7 UNIFIED GOOGLE SIGN-IN LOGIC ---
+  // --- VERSION 7 UNIFIED GOOGLE SIGN-IN LOGIC ---
+  void _setupGoogleSignIn() {
+    // 1. Initialize exactly once (Required in V7)
+    _googleSignIn.initialize(
+      clientId: 'PASTE_YOUR_WEB_CLIENT_ID_HERE.apps.googleusercontent.com', 
+    ).then((_) {
+      
+      // 2. Listen for the new V7 authenticationEvents stream
+      _googleSignIn.authenticationEvents.listen((event) async {
+        
+        // 3. Extract the user securely using Dart pattern matching
+        final GoogleSignInAccount? account = switch (event) {
+          GoogleSignInAuthenticationEventSignIn() => event.user,
+          GoogleSignInAuthenticationEventSignOut() => null,
+        };
+
+        if (account != null) {
+          setState(() => isLoading = true);
+          try {
+            // Retrieve the token synchronously (New in V7)
+            final GoogleSignInAuthentication googleAuth = await account.authentication;
+            
+            if (googleAuth.idToken != null) {
+              await _authenticateWithBackend(googleAuth.idToken!, 'google');
+            } else {
+              _showNotification('Failed to retrieve secure token from Google.', isError: true);
+            }
+          } catch (e) {
+            debugPrint("Google Auth Error: $e");
+            _showNotification('Authentication failed.', isError: true);
+          } finally {
+            if (mounted) setState(() => isLoading = false);
+          }
+        }
+      });
+      
+    });
+  }
+
+  Future<void> _authenticateWithBackend(String idToken, String provider) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$apiUrl/auth/social'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({
+          'id_token': idToken,
+          'provider': provider,
+          'device_token': simulatedDeviceToken
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final String token = data['access_token'];
+        
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('jwt_token', token);
+        
+        if (mounted) {
+          Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => MainLayout(token: token)));
+        }
+      } else {
+        _showNotification('Authentication rejected by server.', isError: true);
+      }
+    } catch (e) {
+      _showNotification('Network error connecting to backend.', isError: true);
+    }
+  }
+  // ----------------------------------------------
 
   Future<void> _pickImage() async {
     final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
@@ -48,14 +133,9 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 
-  // --- NEW: FORGOT PASSWORD DIALOG ---
   Future<void> _showForgotPasswordDialog() async {
     final TextEditingController resetEmailController = TextEditingController();
-    
-    // Pre-fill if they already typed something
-    if (emailController.text.isNotEmpty) {
-      resetEmailController.text = emailController.text;
-    }
+    if (emailController.text.isNotEmpty) resetEmailController.text = emailController.text;
 
     await showDialog(
       context: context,
@@ -69,7 +149,10 @@ class _AuthScreenState extends State<AuthScreen> {
               const SizedBox(height: 16),
               TextField(
                 controller: resetEmailController,
-                decoration: const InputDecoration(labelText: 'Email Address', border: OutlineInputBorder()),
+                decoration: InputDecoration(
+                  labelText: 'Email Address', 
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))
+                ),
                 keyboardType: TextInputType.emailAddress,
               ),
             ],
@@ -84,26 +167,18 @@ class _AuthScreenState extends State<AuthScreen> {
                 onPressed: () async {
                   final email = resetEmailController.text.trim();
                   if (email.isEmpty) return;
-                  
-                  Navigator.pop(context); // Close dialog
-                  
+                  Navigator.pop(context); 
                   try {
                     final response = await http.post(
                       Uri.parse('$apiUrl/auth/forgot-password'),
                       headers: {'Content-Type': 'application/json'},
                       body: json.encode({'email': email}),
                     );
-                    
                     if (response.statusCode == 200) {
                       final data = json.decode(response.body);
                       final String serverToken = data['reset_token'] ?? '';
-                      
                       if (serverToken.isNotEmpty && mounted) {
-                        // Success! Navigate straight to the OTP screen, passing the secure token
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(builder: (context) => ResetPasswordScreen(token: serverToken)),
-                        );
+                        Navigator.push(context, MaterialPageRoute(builder: (context) => ResetPasswordScreen(token: serverToken)));
                       }
                     } else {
                       _showNotification('Failed to send OTP request.', isError: true);
@@ -147,9 +222,7 @@ class _AuthScreenState extends State<AuthScreen> {
           final prefs = await SharedPreferences.getInstance();
           await prefs.setString('jwt_token', token);
           
-          if (mounted) {
-            Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => MainLayout(token: token)));
-          }
+          if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => MainLayout(token: token)));
         } else {
           _showNotification('Invalid email or password.', isError: true);
         }
@@ -166,13 +239,8 @@ class _AuthScreenState extends State<AuthScreen> {
         request.fields['password'] = passwordController.text.trim();
         request.fields['device_token'] = simulatedDeviceToken;
         
-        if (phoneController.text.trim().isNotEmpty) {
-          request.fields['phone'] = phoneController.text.trim();
-        }
-
-        if (_profileImage != null) {
-          request.files.add(await http.MultipartFile.fromPath('avatar', _profileImage!.path));
-        }
+        if (phoneController.text.trim().isNotEmpty) request.fields['phone'] = phoneController.text.trim();
+        if (_profileImage != null) request.files.add(await http.MultipartFile.fromPath('avatar', _profileImage!.path));
 
         var streamedResponse = await request.send().timeout(const Duration(seconds: 20));
         var response = await http.Response.fromStream(streamedResponse);
@@ -197,127 +265,178 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
+  Widget _buildTextField({required TextEditingController controller, required String label, bool isPassword = false, TextInputType type = TextInputType.text}) {
+    return TextField(
+      controller: controller,
+      obscureText: isPassword,
+      keyboardType: type,
+      decoration: InputDecoration(
+        labelText: label,
+        labelStyle: TextStyle(color: Colors.grey.shade600, fontSize: 14),
+        filled: true,
+        fillColor: Colors.grey.shade50,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+        focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: Colors.blueAccent, width: 2)),
+        enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.grey.shade200, width: 1)),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFFF1F5F9), 
       body: Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              if (!isLogin) ...[
-                GestureDetector(
-                  onTap: _pickImage,
-                  child: CircleAvatar(
-                    radius: 45,
-                    backgroundColor: Colors.blueAccent.withOpacity(0.1),
-                    backgroundImage: _profileImage != null ? FileImage(_profileImage!) : null,
-                    child: _profileImage == null
-                        ? const Icon(Icons.add_a_photo, size: 30, color: Colors.blueAccent)
-                        : null,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                const Text("Upload Photo (Optional)", textAlign: TextAlign.center, style: TextStyle(color: Colors.grey, fontSize: 12)),
-                const SizedBox(height: 24),
-              ] else ...[
-                const Icon(Icons.hub, size: 80, color: Colors.blueAccent),
-                const SizedBox(height: 24),
-              ],
-              
-              Text(
-                isLogin ? 'SYSTEM LOGIN' : 'INITIALIZE ACCOUNT',
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Color(0xFF0F172A)),
-              ),
-              const SizedBox(height: 32),
-              
-              if (!isLogin) ...[
-                TextField(
-                  controller: nameController,
-                  decoration: const InputDecoration(labelText: 'Full Name *', border: OutlineInputBorder()),
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: phoneController,
-                  decoration: const InputDecoration(labelText: 'Phone Number (Optional)', border: OutlineInputBorder()),
-                  keyboardType: TextInputType.phone,
-                ),
-                const SizedBox(height: 16),
-              ],
-              
-              TextField(
-                controller: emailController,
-                decoration: InputDecoration(labelText: isLogin ? 'Email Address' : 'Email Address *', border: const OutlineInputBorder()),
-                keyboardType: TextInputType.emailAddress,
-              ),
-              const SizedBox(height: 16),
-              
-              TextField(
-                controller: passwordController,
-                decoration: InputDecoration(labelText: isLogin ? 'Password' : 'Password *', border: const OutlineInputBorder()),
-                obscureText: true,
-              ),
-              
-              if (isLogin)
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton(
-                    onPressed: _showForgotPasswordDialog, // <-- HOOKED UP HERE
-                    child: const Text('Forgot Password?', style: TextStyle(color: Colors.blueAccent)),
-                  ),
-                )
-              else ...[
-                const SizedBox(height: 24),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.orange.shade50,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.orange.shade200)
-                  ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(Icons.lock_outline, color: Colors.orange.shade800, size: 20),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          "SECURITY LOCK: Your Email Address cannot be changed after registration. Profile photo, name, and phone number can be updated later.",
-                          style: TextStyle(fontSize: 12, color: Colors.orange.shade900, height: 1.4),
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 420), 
+            child: Card(
+              elevation: 4,
+              shadowColor: Colors.black12,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+              color: Colors.white,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32.0, vertical: 40.0),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Icon(Icons.hub_rounded, size: 56, color: const Color(0xFF0F172A).withOpacity(0.9)),
+                    const SizedBox(height: 16),
+                    Text(
+                      isLogin ? 'Welcome Back' : 'Create Account',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: Color(0xFF0F172A), letterSpacing: -0.5),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      isLogin ? 'Enter your details to access your workspace.' : 'Sign up to get started with SmartHub.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 14, color: Colors.grey.shade500),
+                    ),
+                    const SizedBox(height: 32),
+                    
+                    if (!isLogin) ...[
+                      Align(
+                        alignment: Alignment.center,
+                        child: GestureDetector(
+                          onTap: _pickImage,
+                          child: CircleAvatar(
+                            radius: 40,
+                            backgroundColor: Colors.blueAccent.withOpacity(0.08),
+                            backgroundImage: _profileImage != null ? FileImage(_profileImage!) : null,
+                            child: _profileImage == null
+                                ? const Icon(Icons.add_a_photo_outlined, size: 28, color: Colors.blueAccent)
+                                : null,
+                          ),
                         ),
                       ),
+                      const SizedBox(height: 24),
+                      _buildTextField(controller: nameController, label: 'Full Name *'),
+                      const SizedBox(height: 16),
+                      _buildTextField(controller: phoneController, label: 'Phone Number (Optional)', type: TextInputType.phone),
+                      const SizedBox(height: 16),
                     ],
-                  ),
-                ),
-                const SizedBox(height: 24),
-              ],
+                    
+                    _buildTextField(controller: emailController, label: isLogin ? 'Email Address' : 'Email Address *', type: TextInputType.emailAddress),
+                    const SizedBox(height: 16),
+                    _buildTextField(controller: passwordController, label: isLogin ? 'Password' : 'Password *', isPassword: true),
+                    
+                    if (isLogin)
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton(
+                          onPressed: _showForgotPasswordDialog,
+                          style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 0), tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                          child: const Text('Forgot Password?', style: TextStyle(color: Colors.blueAccent, fontWeight: FontWeight.w600, fontSize: 13)),
+                        ),
+                      ),
+                      
+                    const SizedBox(height: 24),
 
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.all(16), 
-                  backgroundColor: const Color(0xFF0F172A),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 16), 
+                        backgroundColor: const Color(0xFF0F172A),
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))
+                      ),
+                      onPressed: isLoading ? null : submitAuth,
+                      child: isLoading
+                          ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                          : Text(isLogin ? 'Sign In' : 'Create Account', style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 0.5)),
+                    ),
+                    
+                    const SizedBox(height: 24),
+
+                    Row(
+                      children: [
+                        Expanded(child: Divider(color: Colors.grey.shade200, thickness: 1)),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          child: Text("OR", style: TextStyle(color: Colors.grey.shade400, fontWeight: FontWeight.w600, fontSize: 12)),
+                        ),
+                        Expanded(child: Divider(color: Colors.grey.shade200, thickness: 1)),
+                      ],
+                    ),
+                    const SizedBox(height: 24),
+
+                    // --- THE DYNAMIC SOCIAL BUTTON ---
+                    kIsWeb 
+                    ? SizedBox(
+                        height: 48,
+                        width: double.infinity,
+                        // If Web: Show the un-clickable, Google-rendered security button
+                        child: web.renderButton(), 
+                      )
+                    : OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          side: BorderSide(color: Colors.grey.shade300),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          backgroundColor: Colors.white,
+                        ),
+                        // If Mobile: Allow them to click our custom button!
+                        onPressed: isLoading ? null : () async {
+                          setState(() => isLoading = true);
+                          try {
+                            await _googleSignIn.authenticate();
+                            // The listener in initState() will catch the result!
+                          } catch (e) {
+                            _showNotification('Sign-In canceled.', isError: true);
+                            setState(() => isLoading = false);
+                          }
+                        },
+                        icon: Image.network('https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/120px-Google_%22G%22_logo.svg.png', height: 20),
+                        label: Text('Continue with Google', style: TextStyle(color: Colors.grey.shade800, fontWeight: FontWeight.w600)),
+                      ),
+
+                    const SizedBox(height: 24),
+                    
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(isLogin ? "Don't have an account? " : "Already have an account? ", style: TextStyle(color: Colors.grey.shade600, fontSize: 14)),
+                        GestureDetector(
+                          onTap: () {
+                            setState(() {
+                              isLogin = !isLogin;
+                              passwordController.clear();
+                            });
+                          },
+                          child: Text(
+                            isLogin ? 'Sign up' : 'Log in', 
+                            style: const TextStyle(color: Color(0xFF0F172A), fontWeight: FontWeight.bold, fontSize: 14)
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
-                onPressed: isLoading ? null : submitAuth,
-                child: isLoading
-                    ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                    : Text(isLogin ? 'AUTHENTICATE' : 'REGISTER', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 1)),
               ),
-              
-              const SizedBox(height: 16),
-              TextButton(
-                onPressed: () {
-                  setState(() {
-                    isLogin = !isLogin;
-                    passwordController.clear();
-                  });
-                },
-                child: Text(isLogin ? 'Need an account? Register here' : 'Already have an account? Login here', style: const TextStyle(color: Colors.grey)),
-              ),
-            ],
+            ),
           ),
         ),
       ),

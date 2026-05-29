@@ -4,7 +4,16 @@ backend/.env
 notify/.env
 # Node modules
 node_modules/
-
+backend/.venv
+notify/.venv
+notify/__pycache__/
+notify/firebase-credentials.json
+backend/node_modules/
+backend/app/firebase-credentials.json
+mobile/build/
+mobile/.idea/
+mobile/.dart_tool/
+mobile/android/app/google-services.json
 # Logs
 *.log
 

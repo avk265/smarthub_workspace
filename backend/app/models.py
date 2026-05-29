@@ -1,3 +1,4 @@
+from datetime import datetime
 import uuid
 from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID, ARRAY
@@ -18,6 +19,17 @@ class User(Base):
     device_tokens = Column(ARRAY(Text)) # FCM/APNs tokens
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class AppNotification(Base):
+    __tablename__ = "app_notifications"
+    
+    # We use a UUID string as the primary key
+    id = Column(UUID(as_uuid=True), primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    title = Column(String)
+    message = Column(String)
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
