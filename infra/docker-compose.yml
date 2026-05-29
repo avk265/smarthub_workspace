@@ -1,0 +1,38 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: hub
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+  # ... (your other services above)
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8002:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+
+# ADD THIS AT THE VERY BOTTOM (Left-aligned):
+volumes:
+  pgdata: # (You might already have this one)
+  chroma_data:   # <-- ADD THIS LINE
